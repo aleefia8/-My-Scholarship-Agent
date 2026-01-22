@@ -1,0 +1,435 @@
+
+import React, { useState, useEffect, useMemo } from 'react';
+import { AppSection, StudentProfile, ScholarshipMatch, ApplicationRecord, Notification } from './types';
+import { geminiService } from './services/geminiService';
+import { firebaseService } from './services/firebaseService';
+
+const SidebarItem = ({ icon, label, active, onClick, badge }: { icon: string, label: string, active: boolean, onClick: () => void, badge?: number }) => (
+  <button
+    onClick={onClick}
+    className={`flex items-center justify-between w-full p-3 rounded-xl transition-all ${
+      active ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-600 hover:bg-indigo-50 hover:text-indigo-600'
+    }`}
+  >
+    <div className="flex items-center space-x-3">
+      <i className={`fas ${icon} w-6 text-center`}></i>
+      <span className="font-medium text-sm">{label}</span>
+    </div>
+    {badge && badge > 0 && (
+      <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full">{badge}</span>
+    )}
+  </button>
+);
+
+const App: React.FC = () => {
+  const [activeSection, setActiveSection] = useState<AppSection>(AppSection.HOME);
+  const [loading, setLoading] = useState(false);
+  const [input, setInput] = useState('');
+  const [user, setUser] = useState<any>(null);
+  const [authChecking, setAuthChecking] = useState(true);
+  const [authError, setAuthError] = useState<{ code: string, message: string, domain: string } | null>(null);
+  
+  const [profile, setProfile] = useState<StudentProfile>({ 
+    name: '', gpa: '', major: '', interests: '', gradeLevel: 'High School Senior', 
+    achievements: '', extracurriculars: '', personalStatementFragment: '',
+    trustAutoApply: false
+  });
+  const [matches, setMatches] = useState<ScholarshipMatch[]>([]);
+  const [apps, setApps] = useState<ApplicationRecord[]>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [chatHistory, setChatHistory] = useState<{ role: 'user' | 'model', parts: { text: string }[] }[]>([]);
+  const [selectedDraft, setSelectedDraft] = useState<ApplicationRecord | null>(null);
+
+  useEffect(() => {
+    const unsubscribe = firebaseService.onAuthChange((u: any) => {
+      setUser(u);
+      setAuthChecking(false);
+      if (u) setAuthError(null);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (user?.uid) {
+      const unsubscribe = firebaseService.subscribeToUserData(user.uid, (data: any) => {
+        if (data) {
+          if (data.profile) setProfile(data.profile);
+          if (data.apps) setApps(data.apps);
+          if (data.matches) setMatches(data.matches);
+          if (data.notifications) setNotifications(data.notifications);
+          if (data.chatHistory) setChatHistory(data.chatHistory);
+        }
+      });
+      return () => unsubscribe();
+    }
+  }, [user]);
+
+  const syncToCloud = async (updates: any) => {
+    if (user?.uid) {
+      await firebaseService.saveUserData(user.uid, updates);
+    }
+  };
+
+  const profileStrength = useMemo(() => {
+    let score = 0;
+    if (profile.name) score += 10;
+    if (profile.gpa) score += 10;
+    if (profile.achievements.length > 20) score += 25;
+    if (profile.extracurriculars.length > 20) score += 25;
+    if (profile.personalStatementFragment.length > 50) score += 30;
+    return score;
+  }, [profile]);
+
+  const handleLogin = async () => {
+    setAuthError(null);
+    try {
+      await firebaseService.loginWithGoogle();
+    } catch (err: any) {
+      console.error("Login failed:", err);
+      const currentDomain = window.location.hostname || "localhost";
+      setAuthError({
+        code: err.code || 'unknown',
+        message: err.message || "An unexpected error occurred.",
+        domain: currentDomain
+      });
+    }
+  };
+
+  const handleDiscovery = async () => {
+    setLoading(true);
+    try {
+      const results = await geminiService.getScoredMatches(profile);
+      const newNotif: Notification = {
+        id: Date.now().toString(),
+        type: 'match',
+        title: 'New Matches Found',
+        message: `Discovered ${results.length} scholarships matching your profile.`,
+        date: new Date().toLocaleDateString(),
+        read: false
+      };
+      await syncToCloud({ 
+        matches: results, 
+        notifications: [newNotif, ...notifications] 
+      });
+      setActiveSection(AppSection.MATCHES);
+    } catch (err) { console.error(err); }
+    finally { setLoading(false); }
+  };
+
+  const executeApply = async (match: ScholarshipMatch) => {
+    setLoading(true);
+    try {
+      const draft = await geminiService.draftApplication(match.name, match.requirements, profile);
+      const newApp: ApplicationRecord = {
+        id: Math.random().toString(36).substr(2, 9),
+        scholarshipId: match.id,
+        name: match.name,
+        status: 'Review Required',
+        generatedEssay: draft,
+        aiNotes: "Draft generated by AI for your final approval."
+      };
+      await syncToCloud({ apps: [...apps, newApp] });
+      setActiveSection(AppSection.TRACKER);
+    } catch (err) { console.error(err); }
+    finally { setLoading(false); }
+  };
+
+  const handleChat = async () => {
+    if (!input.trim()) return;
+    const msg = input;
+    setInput('');
+    setLoading(true);
+    try {
+      const response = await geminiService.chat(msg, chatHistory);
+      const newHistory = [...chatHistory, { role: 'user' as const, parts: [{ text: msg }] }, { role: 'model' as const, parts: [{ text: response || '' }] }];
+      await syncToCloud({ chatHistory: newHistory });
+    } catch (err) { console.error(err); }
+    finally { setLoading(false); }
+  };
+
+  if (authChecking) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center">
+        <div className="w-12 h-12 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-6 text-center">
+        <div className="max-w-md w-full space-y-8 animate-fadeIn">
+          <div className="bg-indigo-600 w-24 h-24 rounded-3xl flex items-center justify-center text-white text-4xl mx-auto shadow-2xl">
+            <i className="fas fa-graduation-cap"></i>
+          </div>
+          <div>
+            <h1 className="text-4xl font-black text-white">ScholarshipAI</h1>
+            <p className="text-slate-400 mt-2 text-lg">Your autonomous scholarship discovery agent.</p>
+          </div>
+          <div className="bg-white/5 p-8 rounded-[2rem] border border-white/10 space-y-6">
+            <p className="text-slate-300 text-sm">Securely sync your profile and application drafts across all your devices.</p>
+            
+            {authError && (
+              <div className="bg-red-500/10 border border-red-500/20 p-5 rounded-2xl text-red-400 text-xs text-left leading-relaxed">
+                <div className="flex items-center space-x-2 mb-2 font-bold text-sm">
+                  <i className="fas fa-tools"></i>
+                  <span>One Last Setup Task</span>
+                </div>
+                
+                {authError.code === 'auth/unauthorized-domain' ? (
+                  <div className="space-y-4">
+                    <p className="text-slate-200">Your website is online! Now tell Firebase it's safe to allow logins from this URL.</p>
+                    <div className="p-4 bg-black/40 rounded-xl space-y-3 border border-red-500/10">
+                      <p className="font-bold text-white text-[10px] uppercase tracking-widest opacity-60">Step 1: Copy this Link</p>
+                      <div className="flex items-center space-x-2">
+                        <code className="bg-slate-800 text-indigo-300 px-3 py-2 rounded-lg flex-1 font-mono text-[11px] truncate border border-white/5">{authError.domain}</code>
+                        <button 
+                          onClick={() => {
+                            navigator.clipboard.writeText(authError.domain);
+                            alert("Link copied! Now paste it in your Firebase console.");
+                          }}
+                          className="bg-indigo-600 hover:bg-indigo-500 p-2 px-3 rounded-lg text-white transition-all text-[10px] font-bold"
+                        >
+                          COPY
+                        </button>
+                      </div>
+                      <p className="font-bold text-white text-[10px] uppercase tracking-widest opacity-60 mt-4">Step 2: Paste in Firebase</p>
+                      <ol className="list-decimal list-inside space-y-1 text-[11px] text-slate-400">
+                        <li>Open <a href="https://console.firebase.google.com/" target="_blank" className="text-indigo-400 hover:underline">Firebase Console</a></li>
+                        <li>Click <span className="text-white">Auth</span> &gt; <span className="text-white">Settings</span> &gt; <span className="text-white">Authorized domains</span></li>
+                        <li>Click <span className="text-white">Add domain</span> and paste the link.</li>
+                      </ol>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="mb-3 font-medium">{authError.message}</p>
+                )}
+              </div>
+            )}
+
+            <button 
+              onClick={handleLogin}
+              className="w-full bg-white text-slate-900 font-bold py-4 rounded-2xl flex items-center justify-center space-x-3 hover:bg-slate-100 transition-all shadow-xl"
+            >
+              <i className="fab fa-google text-xl text-blue-500"></i>
+              <span>{authError ? 'Retry Login' : 'Continue with Google'}</span>
+            </button>
+          </div>
+          <p className="text-[10px] text-slate-500 italic opacity-50">Project: {firebaseService.configSummary().projectId}</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex min-h-screen bg-slate-50 font-sans text-slate-800">
+      {/* Sidebar */}
+      <aside className="w-64 bg-white border-r border-slate-200 p-6 hidden lg:flex flex-col fixed h-full">
+        <div className="flex items-center space-x-3 mb-8 px-2">
+          <div className="bg-indigo-600 p-2 rounded-lg text-white shadow-lg">
+            <i className="fas fa-graduation-cap"></i>
+          </div>
+          <h1 className="text-xl font-bold tracking-tight">ScholarshipAI</h1>
+        </div>
+
+        <nav className="space-y-1 flex-1">
+          <SidebarItem icon="fa-th-large" label="Dashboard" active={activeSection === AppSection.HOME} onClick={() => setActiveSection(AppSection.HOME)} />
+          <SidebarItem icon="fa-user-circle" label="My Profile" active={activeSection === AppSection.PROFILE} onClick={() => setActiveSection(AppSection.PROFILE)} />
+          <SidebarItem icon="fa-magic" label="AI Matches" active={activeSection === AppSection.MATCHES} onClick={() => setActiveSection(AppSection.MATCHES)} />
+          <SidebarItem icon="fa-tasks" label="Application Hub" active={activeSection === AppSection.TRACKER} onClick={() => setActiveSection(AppSection.TRACKER)} />
+          <SidebarItem icon="fa-comment-alt" label="AI Assistant" active={activeSection === AppSection.CHAT} onClick={() => setActiveSection(AppSection.CHAT)} />
+          <SidebarItem icon="fa-bell" label="Alerts" active={activeSection === AppSection.NOTIFICATIONS} onClick={() => setActiveSection(AppSection.NOTIFICATIONS)} badge={notifications.filter(n => !n.read).length} />
+        </nav>
+
+        <div className="mt-auto pt-6 border-t border-slate-100">
+          <div className="flex items-center space-x-3 px-2 mb-4">
+            <img src={user.photoURL || `https://ui-avatars.com/api/?name=${user.displayName}`} className="w-8 h-8 rounded-full border border-slate-200" alt="Avatar" />
+            <div className="overflow-hidden text-slate-800">
+              <p className="text-xs font-bold truncate">{user.displayName}</p>
+              <p className="text-[10px] text-slate-400 truncate">Cloud Sync Active</p>
+            </div>
+          </div>
+          <button 
+            onClick={() => firebaseService.logout()}
+            className="w-full p-2 text-slate-400 hover:text-red-500 transition-all text-xs font-medium flex items-center space-x-2"
+          >
+            <i className="fas fa-sign-out-alt"></i>
+            <span>Sign Out</span>
+          </button>
+        </div>
+      </aside>
+
+      {/* Main Content */}
+      <main className="flex-1 lg:ml-64 p-4 md:p-10">
+        <div className="max-w-5xl mx-auto">
+          {activeSection === AppSection.HOME && (
+            <div className="space-y-8 animate-fadeIn">
+              <header>
+                <h2 className="text-3xl font-extrabold text-slate-900">Welcome, {user.displayName?.split(' ')[0]}! ✨</h2>
+                <p className="text-slate-500 mt-1">Your autonomous scholarship agent is online and ready.</p>
+              </header>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
+                  <p className="text-slate-400 text-[10px] font-bold uppercase mb-2">Available Matches</p>
+                  <p className="text-3xl font-bold text-slate-800">{matches.length}</p>
+                </div>
+                <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
+                  <p className="text-slate-400 text-[10px] font-bold uppercase mb-2">Applications</p>
+                  <p className="text-3xl font-bold text-indigo-600">{apps.length}</p>
+                </div>
+                <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
+                  <p className="text-slate-400 text-[10px] font-bold uppercase mb-2">Profile Strength</p>
+                  <p className="text-3xl font-bold text-emerald-600">{profileStrength}%</p>
+                </div>
+              </div>
+
+              <div className="bg-indigo-900 text-white p-10 rounded-[2.5rem] shadow-xl relative overflow-hidden group">
+                <div className="relative z-10 max-w-lg">
+                  <h3 className="text-3xl font-black mb-4">Run Discovery Scan</h3>
+                  <p className="text-indigo-200 mb-8 leading-relaxed">Let AI scan over 10,000 active scholarships to find the perfect matches for your 2025 academic goals.</p>
+                  <button onClick={handleDiscovery} className="bg-white text-indigo-900 px-8 py-4 rounded-2xl font-black shadow-lg hover:scale-105 transition-all">Start Agent Discovery</button>
+                </div>
+                <div className="absolute top-0 right-0 p-12 opacity-10 group-hover:scale-110 transition-transform">
+                  <i className="fas fa-robot text-[12rem]"></i>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeSection === AppSection.PROFILE && (
+            <div className="max-w-2xl mx-auto animate-fadeIn">
+              <div className="bg-white p-10 rounded-[2.5rem] border border-slate-200 shadow-xl">
+                <h3 className="text-2xl font-black text-slate-900 mb-8">Scholar Identity</h3>
+                <div className="space-y-6">
+                  <div className="grid grid-cols-2 gap-6">
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Full Name</label>
+                      <input type="text" value={profile.name} onChange={e => setProfile({...profile, name: e.target.value})} className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all" />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">GPA</label>
+                      <input type="text" value={profile.gpa} onChange={e => setProfile({...profile, gpa: e.target.value})} className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all" />
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Key Achievements</label>
+                    <textarea value={profile.achievements} onChange={e => setProfile({...profile, achievements: e.target.value})} className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl h-32 focus:ring-2 focus:ring-indigo-500 outline-none resize-none" placeholder="List awards, honors, or special recognitions..." />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Personal Narrative</label>
+                    <textarea value={profile.personalStatementFragment} onChange={e => setProfile({...profile, personalStatementFragment: e.target.value})} className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl h-40 focus:ring-2 focus:ring-indigo-500 outline-none resize-none" placeholder="Paste fragments of your personal statement or story..." />
+                  </div>
+                  <button onClick={() => syncToCloud({ profile })} className="w-full py-4 bg-indigo-600 text-white rounded-2xl font-bold shadow-lg hover:bg-indigo-700 transition-all flex items-center justify-center space-x-2">
+                    <i className="fas fa-cloud-upload-alt"></i>
+                    <span>Sync Profile to Cloud</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeSection === AppSection.MATCHES && (
+            <div className="space-y-6 animate-fadeIn">
+              <h2 className="text-2xl font-bold text-slate-900">Recommended for You</h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {matches.map(m => (
+                  <div key={m.id} className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm hover:border-indigo-400 transition-colors">
+                    <div className="flex justify-between items-start mb-4">
+                      <span className="text-indigo-600 font-black text-2xl">{m.amount}</span>
+                      <span className="bg-indigo-50 text-indigo-600 text-[10px] font-bold px-3 py-1 rounded-full uppercase">{m.matchScore}% Match</span>
+                    </div>
+                    <h4 className="text-xl font-bold text-slate-900 mb-2">{m.name}</h4>
+                    <p className="text-sm text-slate-500 mb-6 line-clamp-2">{m.reason}</p>
+                    <button onClick={() => executeApply(m)} className="w-full py-3 bg-indigo-600 text-white rounded-xl font-bold hover:bg-indigo-700 transition-all">Prepare Application</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {activeSection === AppSection.TRACKER && (
+             <div className="space-y-6 animate-fadeIn">
+              <h2 className="text-2xl font-bold text-slate-900">Application Hub</h2>
+              <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm overflow-hidden">
+                <table className="w-full text-left">
+                  <thead className="bg-slate-50 border-b border-slate-100">
+                    <tr>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase">Scholarship</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase">Status</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase text-right">Draft</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-50">
+                    {apps.map(app => (
+                      <tr key={app.id}>
+                        <td className="px-6 py-5 font-bold text-slate-800">{app.name}</td>
+                        <td className="px-6 py-5">
+                          <span className={`px-3 py-1 rounded-full text-[10px] font-bold uppercase bg-amber-100 text-amber-700`}>{app.status}</span>
+                        </td>
+                        <td className="px-6 py-5 text-right">
+                          <button onClick={() => setSelectedDraft(app)} className="px-4 py-2 bg-indigo-50 text-indigo-600 rounded-lg font-bold text-xs hover:bg-indigo-600 hover:text-white transition-all">View & Edit</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {activeSection === AppSection.CHAT && (
+            <div className="flex flex-col h-[75vh] bg-white rounded-[2.5rem] border border-slate-200 shadow-2xl overflow-hidden animate-fadeIn">
+              <div className="p-6 border-b border-slate-100 bg-slate-50/50 flex items-center space-x-3">
+                  <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center text-white"><i className="fas fa-robot"></i></div>
+                  <h3 className="font-bold text-slate-900">Scholarship Concierge</h3>
+              </div>
+              <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                {chatHistory.map((msg, i) => (
+                  <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                    <div className={`max-w-[80%] p-4 rounded-2xl ${msg.role === 'user' ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-100 text-slate-800 border border-slate-200'}`}>
+                      <p className="text-sm whitespace-pre-wrap leading-relaxed">{msg.parts[0].text}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="p-6 border-t border-slate-100 flex items-center space-x-4">
+                <input type="text" value={input} onChange={e => setInput(e.target.value)} onKeyPress={e => e.key === 'Enter' && handleChat()} placeholder="Ask for advice..." className="flex-1 p-4 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:ring-2 focus:ring-indigo-500 transition-all text-slate-800" />
+                <button onClick={handleChat} disabled={loading} className="w-12 h-12 bg-indigo-600 text-white rounded-2xl flex items-center justify-center shadow-lg transition-all hover:bg-indigo-700 disabled:opacity-50"><i className="fas fa-paper-plane"></i></button>
+              </div>
+            </div>
+          )}
+        </div>
+      </main>
+
+      {/* Draft Modal */}
+      {selectedDraft && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[60] flex items-center justify-center p-6">
+          <div className="bg-white rounded-[2.5rem] shadow-2xl max-w-2xl w-full max-h-[80vh] flex flex-col overflow-hidden animate-scaleIn">
+            <div className="p-8 border-b border-slate-100 bg-slate-50 flex items-center justify-between">
+              <h3 className="text-xl font-bold text-slate-900">{selectedDraft.name}</h3>
+              <button onClick={() => setSelectedDraft(null)} className="text-slate-400 hover:text-red-500 transition-all text-xl"><i className="fas fa-times"></i></button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-8 bg-white whitespace-pre-wrap text-sm text-slate-700 leading-relaxed font-serif">
+              {selectedDraft.generatedEssay}
+            </div>
+            <div className="p-6 bg-slate-50 border-t border-slate-100 flex justify-end">
+              <button onClick={() => setSelectedDraft(null)} className="px-6 py-2 bg-slate-900 text-white rounded-xl font-bold">Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {loading && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-6">
+          <div className="bg-white p-10 rounded-[3rem] shadow-2xl text-center">
+            <div className="w-16 h-16 border-4 border-indigo-100 border-t-indigo-600 rounded-full animate-spin mx-auto mb-4"></div>
+            <p className="font-bold text-slate-900">AI is working...</p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default App;
